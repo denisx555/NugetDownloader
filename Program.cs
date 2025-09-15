@@ -3,6 +3,7 @@ using System.Xml.Linq;
 using System.Net.Http;
 using System.Security.Cryptography.X509Certificates;
 using System.Net;
+using System.IO;
 
 namespace NugetDownloader
 {
@@ -40,36 +41,71 @@ namespace NugetDownloader
                 name: "--password",
                 description: "Password for the private repository.");
 
+            var logFileOption = new Option<FileInfo>(
+                name: "--log-file",
+                description: "Optional path to a log file.");
+
             rootCommand.AddOption(directoryPackagesPropsPathOption);
             rootCommand.AddOption(outputDirectoryOption);
             rootCommand.AddOption(nugetSourcesOption);
             rootCommand.AddOption(disableSslValidationOption);
             rootCommand.AddOption(usernameOption);
             rootCommand.AddOption(passwordOption);
+            rootCommand.AddOption(logFileOption);
 
-            rootCommand.SetHandler(async (propsPath, outputDir, sources, disableSslValidation, user, pass) =>
+            rootCommand.SetHandler(async (propsPath, outputDir, sources, disableSslValidation, user, pass, logFile) =>
             {
-                await DownloadPackages(propsPath, outputDir, sources, disableSslValidation, user, pass);
+                await DownloadPackages(propsPath, outputDir, sources, disableSslValidation, user, pass, logFile);
             },
-            directoryPackagesPropsPathOption, outputDirectoryOption, nugetSourcesOption, disableSslValidationOption, usernameOption, passwordOption);
+            directoryPackagesPropsPathOption, outputDirectoryOption, nugetSourcesOption, disableSslValidationOption, usernameOption, passwordOption, logFileOption);
 
             await rootCommand.InvokeAsync(args);
         }
 
-        static async Task DownloadPackages(FileInfo propsPath, DirectoryInfo outputDir, string[] nugetSources, bool disableSslValidation, string? username, string? password)
+        static async Task DownloadPackages(FileInfo propsPath, DirectoryInfo outputDir, string[] nugetSources, bool disableSslValidation, string? username, string? password, FileInfo? logFile)
         {
+            // Clear the log file on a new run if it's specified
+            if (logFile != null && File.Exists(logFile.FullName))
+            {
+                File.Delete(logFile.FullName);
+            }
+
+            var logLock = new object();
+
+            Action<string, ConsoleColor?> log = (message, color) =>
+            {
+                lock (logLock)
+                {
+                    if (color.HasValue)
+                    {
+                        Console.ForegroundColor = color.Value;
+                        Console.WriteLine(message);
+                        Console.ResetColor();
+                    }
+                    else
+                    {
+                        Console.WriteLine(message);
+                    }
+
+                    if (logFile != null)
+                    {
+                        File.AppendAllText(logFile.FullName, $"[{System.DateTime.UtcNow:O}] {message}\n");
+                    }
+                }
+            };
+
             var allSources = nugetSources.SelectMany(s => s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToArray();
-            Console.WriteLine($"Reading {propsPath.FullName}...");
+            log($"Reading {propsPath.FullName}...", null);
 
             if (!propsPath.Exists)
             {
-                Console.WriteLine($"Error: File not found at {propsPath.FullName}");
+                log($"Error: File not found at {propsPath.FullName}", ConsoleColor.Red);
                 return;
             }
 
             if (!outputDir.Exists)
             {
-                Console.WriteLine($"Creating output directory: {outputDir.FullName}");
+                log($"Creating output directory: {outputDir.FullName}", null);
                 outputDir.Create();
             }
 
@@ -92,7 +128,7 @@ namespace NugetDownloader
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error parsing {propsPath.FullName}: {ex.Message}");
+                log($"Error parsing {propsPath.FullName}: {ex.Message}", ConsoleColor.Red);
                 return;
             }
 
@@ -100,7 +136,7 @@ namespace NugetDownloader
                 .Where(p => !File.Exists(Path.Combine(outputDir.FullName, $"{p.Id}.{p.Version}.nupkg")))
                 .ToList();
 
-            Console.WriteLine($"Found {packages.Count} total packages. Need to download {packagesToDownload.Count}.");
+            log($"Found {packages.Count} total packages. Need to download {packagesToDownload.Count}.", null);
 
             var httpClientHandler = new HttpClientHandler();
             if (disableSslValidation)
@@ -124,7 +160,7 @@ namespace NugetDownloader
                 bool downloaded = false;
                 foreach (var source in allSources)
                 {
-                    Console.WriteLine($"→ Checking {source} for {id}.{version}");
+                    log($"→ Checking {source} for {id}.{version}", null);
                     string downloadUrl = "";
 
                     if (source.Contains("api.nuget.org/v3-flatcontainer", StringComparison.OrdinalIgnoreCase))
@@ -136,52 +172,53 @@ namespace NugetDownloader
                         downloadUrl = $"{source.TrimEnd('/')}/{id}/{version}";
                     }
 
+                    log($"  [DEBUG] Attempting to download from URL: {downloadUrl}", ConsoleColor.Cyan);
+
                     try
                     {
                         var response = await httpClient.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
                         if (response.IsSuccessStatusCode)
                         {
-                            using (var contentStream = await response.Content.ReadAsStreamAsync())
+                            using (var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken))
                             using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None))
                             {
                                 await contentStream.CopyToAsync(fileStream, cancellationToken);
                             }
-                            Console.ForegroundColor = ConsoleColor.Green;
-                            Console.WriteLine($"✔ {id}.{version} (downloaded from {source})");
-                            Console.ResetColor();
+                            log($"✔ {id}.{version} (downloaded from {source})", ConsoleColor.Green);
                             downloaded = true;
                             break;
                         }
                         else
                         {
-                            Console.ForegroundColor = ConsoleColor.Red;
-                            Console.WriteLine($"✖ {id}.{version} (failed from {source}: {response.StatusCode})");
-                            Console.ResetColor();
+                            log($"✖ {id}.{version} (failed from {source}: {response.StatusCode})", ConsoleColor.Red);
+                            log($"  [DEBUG] Response Headers: {response.Headers.ToString().Replace("\r\n", " ")}", ConsoleColor.Yellow);
+                            if (response.Content.Headers.ContentType != null)
+                            {
+                                log($"  [DEBUG] Content-Type: {response.Content.Headers.ContentType}", ConsoleColor.Yellow);
+                            }
                         }
                     }
                     catch (HttpRequestException httpEx)
                     {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"✖ {id}.{version} (HTTP error from {source}: {httpEx.Message})");
-                        Console.ResetColor();
+                        log($"✖ {id}.{version} (HTTP error from {source}: {httpEx.Message})", ConsoleColor.Red);
                     }
                     catch (Exception ex)
                     {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"✖ {id}.{version} (error from {source}: {ex.Message})");
-                        Console.ResetColor();
+                        log($"✖ {id}.{version} (error from {source}: {ex.Message})", ConsoleColor.Red);
                     }
                 }
 
                 if (!downloaded)
                 {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"‼ {id}.{version} (not found in any source)");
-                    Console.ResetColor();
+                    log($"‼ {id}.{version} (not found in any source)", ConsoleColor.Red);
                 }
             });
 
-            Console.WriteLine("Download process completed.");
+            log("Download process completed.", null);
+            if (logFile != null)
+            {
+                log($"Log file written to {logFile.FullName}", null);
+            }
         }
     }
 }
